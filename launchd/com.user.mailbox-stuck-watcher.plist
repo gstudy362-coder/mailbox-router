@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+                       "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.user.mailbox-stuck-watcher</string>
+
+  <!-- 註冊表驅動卡信 watcher：常駐，每輪先投遞（mailbox_router --once）→ 掃
+       **所有**已註冊方 inbox → 信卡 > STUCK_THRESHOLD（預設 15 分）→ Telegram
+       告警「請開 session <name> 收信」（同信每 6h 再提醒；信離開 inbox 自動清）。
+       只告警、絕不代處理。取代任何只盯單一方的舊版 watcher（單方版會讓其他方的卡信默默漏掉）。 -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>/ABSOLUTE/PATH/TO/mailbox-router/mailbox_stuck_watcher.py</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/ABSOLUTE/PATH/TO/mailbox-router</string>
+
+  <!-- KeepAlive：crash/當機/跨機重開自動回來（這正是要根治的告警斷層）；
+       RunAtLoad 開機即啟；Background 低優先；ThrottleInterval 防瘋狂重啟。 -->
+  <key>KeepAlive</key><true/>
+  <key>RunAtLoad</key><true/>
+  <key>ProcessType</key><string>Background</string>
+  <key>ThrottleInterval</key><integer>30</integer>
+
+  <key>StandardOutPath</key><string>/ABSOLUTE/PATH/TO/mailbox-router/.state/stuck-watcher.out</string>
+  <key>StandardErrorPath</key><string>/ABSOLUTE/PATH/TO/mailbox-router/.state/stuck-watcher.err</string>
+</dict>
+</plist>
