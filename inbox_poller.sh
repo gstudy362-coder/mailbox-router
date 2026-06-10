@@ -30,7 +30,39 @@ INBOX="$MBOX/inbox"
 INFLIGHT="$MBOX/.poller_inflight"          # 行格式： "<epoch> <basename>"
 RETRY_SEC="${RETRY_SEC:-900}"              # 信卡在 inbox 超過此秒數 → 視為我沒處理完、重喚醒
 MAX_CYCLES="${MAX_CYCLES:-1440}"           # ~24h 安全上限
+mkdir -p "$INBOX"                          # 防 cwd 飄移／信箱未建 → 後續操作有依靠
+
+# ── 同名單實例守門（治本，atomic mkdir 鎖）──────────────────────────────
+# 為何用鎖而非 pgrep：兩個同名 poller 並存會搶同一個 .poller_inflight、互相干擾；
+# 過去全靠各 session 自律 `pkill` 清理，裸 `pkill -f inbox_poller.sh` 還會誤殺別名
+# session 的 poller。用 pgrep 掃描判同名「不可靠」：pgrep -f 會抓到自己命令替換 pipeline
+# 的暫態 pre-exec fork（cmdline 仍是父程序的 "inbox_poller.sh NAME"）→ 連「孤身啟動」
+# 都可能誤判而自我拒絕；且有 TOCTOU 競態。改用 atomic `mkdir` 鎖住 mailbox（= 真正會被
+# 雙實例污染的 .poller_inflight 所在）：mkdir 是原子操作，無自我誤判、無競態。鎖內記
+# holder pid；holder 已死（被 kill -9 留下的 stale 鎖）→ 安全接管；退出時 trap 自動釋放。
+LOCKDIR="$MBOX/.poller.lock"
+acquire_lock() {
+  if mkdir "$LOCKDIR" 2>/dev/null; then return 0; fi      # 取得鎖
+  local holder; holder="$(cat "$LOCKDIR/pid" 2>/dev/null || true)"
+  if [ -n "$holder" ] && kill -0 "$holder" 2>/dev/null; then
+    return 1                                               # 有活著的同名 poller → 拒絕
+  fi
+  rm -rf "$LOCKDIR" 2>/dev/null                            # stale 鎖（holder 不存在）→ 接管
+  mkdir "$LOCKDIR" 2>/dev/null || return 1                 # 競爭接管失敗（別人先接管）→ 拒絕
+  return 0
+}
+if acquire_lock; then
+  echo $$ > "$LOCKDIR/pid"
+  trap 'rm -rf "$LOCKDIR"' EXIT
+else
+  holder="$(cat "$LOCKDIR/pid" 2>/dev/null || true)"
+  echo "❌ 已有同名 poller 在跑（name=$NAME, pid=${holder:-?}）— 拒絕重複啟動，避免雙實例搶 .poller_inflight"
+  exit 2
+fi
+
 touch "$INFLIGHT"
+# 身份行（可診斷性）：任何異常退出時，task output 至少留下 name/pid/mbox/起始時間可比對。
+echo "▶ poller name=$NAME pid=$$ mbox=$MBOX start=$(date '+%m-%d %H:%M:%S')"
 
 for i in $(seq 1 "$MAX_CYCLES"); do
   # 報到＋保活：由 registry CLI 寫/更新自己的 entry（含自宣告能力 roles/description、

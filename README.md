@@ -54,6 +54,12 @@ that by copy-pasting between terminals is slow and lossy. `mailbox-router` makes
   current stage (who's waiting on whom), router health, and stuck mail. It never writes state.
 - **Stuck-mail watcher** — a launchd-resident watcher scans every registered party's inbox and
   alerts (Telegram) when a letter sits too long. Alert-only; it never processes mail.
+- **Single-instance poller guard** — `inbox_poller.sh` takes an atomic `mkdir` lock on its mailbox
+  at startup, so a duplicate same-name poller refuses (`exit 2`) instead of corrupting shared
+  in-flight state; a stale lock (dead holder, e.g. after `kill -9`) is safely taken over on the
+  next start. So when restarting, only kill *your own* poller by name
+  (`pkill -f "inbox_poller.sh <name>"`) — a blanket `pkill -f inbox_poller.sh` would also kill
+  other sessions' pollers.
 
 ## Quickstart
 
