@@ -60,6 +60,15 @@ that by copy-pasting between terminals is slow and lossy. `mailbox-router` makes
   next start. So when restarting, only kill *your own* poller by name
   (`pkill -f "inbox_poller.sh <name>"`) — a blanket `pkill -f inbox_poller.sh` would also kill
   other sessions' pollers.
+- **Reliable poller relaunch (Stop hook)** — the wake poller is a `run_in_background` task that
+  exits each time it wakes the session, so the session must relaunch it; relying on the model to
+  remember is unreliable. The optional Stop hook (`hooks/stop_relaunch_poller.py`, wired via
+  `hooks/install_stop_hook.py`) blocks turn-end for a participating session whose poller is down and
+  tells the model to relaunch it — turning the manual step into a system guarantee. It only compels
+  the model (a hook-launched detached process can't wake the session), is scoped to participants
+  (`.mailbox-card` or a registry entry for the cwd), blocks at most once per turn (a nudge marker),
+  and fails open. It cannot help a session that has been exited/closed; delivery is launchd-backed
+  regardless.
 
 ## Quickstart
 
@@ -76,6 +85,9 @@ python3 dashboard_tui.py
 
 # deliver one round manually:
 python3 mailbox_router.py --once
+
+# (optional) make poller relaunch reliable — wire the Stop hook into ~/.claude/settings.json:
+python3 hooks/install_stop_hook.py
 ```
 
 ## Letter format (front-matter)
