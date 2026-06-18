@@ -208,6 +208,48 @@ def test_breaker_trips_after_no_progress_cap():
     assert tripped is True and "turn" in reason.lower()
 
 
+# ---------- 斷路器修飽和：出貨/收尾即推進、不因終結飽和 ----------
+
+def test_delivery_stream_after_terminal_never_trips():
+    # 一方早回 done（hwm 飽和到 4），另一方持續出 deliver(rank3)。
+    # 舊行為：deliver 不 > hwm4 → turns 累加 → 20 封後誤觸。
+    # 新行為：出貨即推進 → turns 每封歸零 → 永不誤觸。
+    state = {}
+    r.record_stage(state, "t", "dashboard", "done")          # hwm4, turns0
+    for _ in range(r.MAX_NOPROGRESS_TURNS + 5):
+        r.record_stage(state, "t", "service-a", "deliver")
+        tripped, _ = r.breaker_check("t", state, max_turns=r.MAX_NOPROGRESS_TURNS)
+        assert tripped is False
+    assert state["thread_turns"]["t"] == 0
+
+
+def test_block_stream_still_trips_after_terminal():
+    # 修飽和不能放水：終結後若只剩 block/ask 鬼打牆（無出貨無收尾）仍要 trip。
+    state = {}
+    r.record_stage(state, "t", "dashboard", "done")          # hwm4
+    for _ in range(r.MAX_NOPROGRESS_TURNS):
+        r.record_stage(state, "t", "service-a", "block")
+    tripped, _ = r.breaker_check("t", state, max_turns=r.MAX_NOPROGRESS_TURNS)
+    assert tripped is True
+
+
+# ---------- 斷路器告警閂鎖：每停滯週期只告警一次 ----------
+
+def test_breaker_alert_latches_once_per_stall():
+    state = {}
+    assert r.note_breaker_alert("t", state) is True     # 首次 → 告警
+    assert r.note_breaker_alert("t", state) is False    # 同停滯週期 → 不再告警
+    assert r.note_breaker_alert("t", state) is False
+
+
+def test_progress_re_arms_breaker_alert():
+    state = {}
+    r.note_breaker_alert("t", state)                     # 已告警、閂鎖
+    r.record_stage(state, "t", "service-a", "deliver")   # 推進 → 歸零並清閂鎖
+    assert state.get("thread_alerted", {}).get("t") in (None, False)
+    assert r.note_breaker_alert("t", state) is True      # 停滯解除後可再告警
+
+
 # ---------- STAGE lifecycle: is_converged (stage-aware 收斂) ----------
 
 def test_is_converged_both_terminal_true():

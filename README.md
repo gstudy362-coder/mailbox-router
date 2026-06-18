@@ -43,6 +43,11 @@ that by copy-pasting between terminals is slow and lossy. `mailbox-router` makes
   `done` / `reject` / `fyi`). Convergence (everyone terminal) silences a thread; a progress-aware
   circuit breaker only trips on *no forward progress*, never on a healthy busy thread; mutual `block`
   raises a deadlock alert. So threads never get silently stuck.
+  - *Progress is non-saturating*: progress = raising the thread's stage high-water mark **or**
+    shipping/closing (a `deliver` or terminal letter). So an active stream — one party already `done`
+    while another keeps shipping `deliver`s — never false-trips; only `ask`/`accept`/`block`
+    ping-pong with nothing shipped accumulates toward the cap. The trip alert is latched per thread
+    (one alert per stall episode; progress re-arms it) so a stuck thread doesn't re-alert every pass.
 - **Dynamic session registry** — any session registers by starting its poller, which heartbeats a
   `.state/registry/<name>.json` entry. Others see who is `online / processing / offline` and can
   address them by name. Entries persist while offline so mail still waits in their inbox.
@@ -69,6 +74,18 @@ that by copy-pasting between terminals is slow and lossy. `mailbox-router` makes
   (`.mailbox-card` or a registry entry for the cwd), blocks at most once per turn (a nudge marker),
   and fails open. It cannot help a session that has been exited/closed; delivery is launchd-backed
   regardless.
+- **Codex wake adapter (second wake path)** — a Claude Code session self-wakes via `inbox_poller.sh`
+  (the poller exits → the harness resumes the live session). An OpenAI Codex CLI participant has no
+  such harness hook, so it gets a second wake adapter: a launchd watcher (`WatchPaths` on the Codex
+  inbox + a `StartInterval` backstop) runs `codex_wake.sh`, which wakes Codex by **resuming one fixed
+  mailbox session** — `codex exec resume <session-id>` — so Codex continues the *same* live session
+  (accumulating context + an on-disk transcript at `~/.codex/sessions/.../rollout-<id>.jsonl` you can
+  `tail -f`) instead of cold-starting a stranger each time. The first wake cold-starts `codex exec`,
+  captures the session id (`codex_wake.py:parse_session_id`), and persists it to
+  `mailbox/.codex_session_id`; a failed resume self-heals to a cold start. Codex is treated as a
+  trusted peer — no privilege cage, it runs under its own `~/.codex/config.toml`. Single-instance via
+  the same atomic `mkdir` lock; it bails out when the inbox has no unprocessed mail. Traceability is
+  two-level: the mailbox letters (the cowork audit trail) and the fixed session's rollout transcript.
 
 ## Quickstart
 
@@ -119,7 +136,8 @@ desc: owns FinMind ingestion (daily + streaming)
 |------|------|
 | `mailbox_router.py` | delivery-only router: scan outboxes → deliver by name; sha1 dedup; STAGE breaker/convergence/deadlock; single-flight lock |
 | `registry.py` | session registry read/write + liveness; self-declared roles/description; `write-self` CLI |
-| `inbox_poller.sh` | per-session wake poller + heartbeat registration |
+| `inbox_poller.sh` | per-session wake poller + heartbeat registration (Claude sessions) |
+| `codex_wake.sh` + `codex_wake.py` | Codex wake adapter: launchd-triggered `codex exec resume` of a fixed mailbox session |
 | `dashboard_tui.py` | read-only ANSI dashboard |
 | `mailbox_stuck_watcher.py` + `launchd/*.plist` | registry-driven stuck-mail alerting |
 | `tests/` | pure-function unit tests (`pytest`) |
@@ -127,7 +145,7 @@ desc: owns FinMind ingestion (daily + streaming)
 ## Tests
 
 ```bash
-python3 -m pytest -q     # 114 tests, pure stdlib
+python3 -m pytest -q     # 133 tests, pure stdlib
 ```
 
 ## License

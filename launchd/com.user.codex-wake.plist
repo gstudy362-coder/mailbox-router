@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+                       "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.user.codex-wake</string>
+
+  <!-- Codex 的 wake 轉接器（mailbox-router 的第二種 wake adapter）。
+       Claude 靠 inbox_poller.sh 自我喚醒；Codex 沒有 harness hook，改由本 watcher 盯
+       Codex inbox：來信即跑 codex_wake.sh → 用 `codex exec resume <固定 session-id>` 接續
+       同一條 mailbox session 處理、回信、歸檔。非常駐：每次觸發跑完即退，單例由腳本鎖保證。
+       安裝（新版 macOS）：把本檔複製到 ~/Library/LaunchAgents/（bootstrap 不吃 symlink），再
+       `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.user.codex-wake.plist`。
+       下方所有 /ABSOLUTE/PATH/TO/... 與 PATH 請改成你的實際路徑（PATH 必須含 codex CLI 所在目錄）。 -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/ABSOLUTE/PATH/TO/mailbox-router/codex_wake.sh</string>
+    <string>codex</string>
+    <string>/ABSOLUTE/PATH/TO/codex-repo/mailbox</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/ABSOLUTE/PATH/TO/mailbox-router</string>
+
+  <!-- 事件觸發：Codex inbox 落檔即跑。StartInterval 當兜底（WatchPaths 偶爾漏觸發）。
+       不用 KeepAlive：一次性處理，不是常駐服務。 -->
+  <key>WatchPaths</key>
+  <array>
+    <string>/ABSOLUTE/PATH/TO/codex-repo/mailbox/inbox</string>
+  </array>
+  <key>StartInterval</key><integer>120</integer>
+  <key>RunAtLoad</key><true/>
+  <key>ProcessType</key><string>Background</string>
+  <key>ThrottleInterval</key><integer>10</integer>
+
+  <!-- launchd 的 PATH 極簡，找不到 codex / python3 → 明確補上（含 codex CLI 所在目錄）。 -->
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>/ABSOLUTE/PATH/TO/codex-cli-bin:/usr/local/bin:/usr/bin:/bin</string>
+  </dict>
+
+  <key>StandardOutPath</key><string>/ABSOLUTE/PATH/TO/mailbox-router/.state/codex-wake.out</string>
+  <key>StandardErrorPath</key><string>/ABSOLUTE/PATH/TO/mailbox-router/.state/codex-wake.err</string>
+</dict>
+</plist>

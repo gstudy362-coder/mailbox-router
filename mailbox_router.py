@@ -58,6 +58,7 @@ def parse_headers(text: str) -> dict:
 # 推進到更高 rank → 計數歸零；終結集 rank=4；block=0（卡住，不抬水位、非終結）。
 _STAGE_RANK = {"block": 0, "ask": 1, "accept": 2, "deliver": 3,
                "done": 4, "reject": 4, "fyi": 4}
+DELIVER_RANK = _STAGE_RANK["deliver"]   # 出貨/收尾（rank≥此）即推進，不因終結飽和
 TERMINAL_STAGES = frozenset({"done", "reject", "fyi"})
 
 
@@ -95,9 +96,25 @@ def record_stage(state: dict, thread: str, party: str, stage: str) -> None:
     state["thread_turns"][thread] = state["thread_turns"].get(thread, 0) + 1
     state["thread_stage"].setdefault(thread, {})[party] = stage
     rank = stage_rank(stage)
-    if rank > state["thread_hwm"].get(thread, 0):
+    raised = rank > state["thread_hwm"].get(thread, 0)
+    if raised:
         state["thread_hwm"][thread] = rank
+    # 推進 = 抬高水位（raised）或 出貨/收尾信（rank≥deliver）。後者讓「終結後仍活躍
+    # 的串流」(hwm 已飽和) 不再誤觸——出一封即算推進、turns 歸零。只有非出貨非推進的
+    # ask/accept/block 才累加。推進同時清告警閂鎖（停滯解除 → 可再次告警）。
+    if raised or rank >= DELIVER_RANK:
         state["thread_turns"][thread] = 0
+        state.get("thread_alerted", {}).pop(thread, None)
+
+
+def note_breaker_alert(thread: str, state: dict) -> bool:
+    """斷路器告警閂鎖：同一條 thread 每個停滯週期只回 True 一次（首次告警），
+    其後回 False（抑制重複轟炸），直到 record_stage 因推進清掉閂鎖。"""
+    alerted = state.setdefault("thread_alerted", {})
+    if alerted.get(thread):
+        return False
+    alerted[thread] = True
+    return True
 
 
 def is_converged(state: dict, thread: str) -> bool:
@@ -215,8 +232,11 @@ def deliver_new_letters(state: dict, *, dry_run: bool) -> list:
             thread = hdr["thread"] or letter.stem
             tripped, reason = breaker_check(thread, state, max_turns=MAX_NOPROGRESS_TURNS)
             if tripped:
-                log(f"BREAKER {reason} → 暫停投遞 {letter.name}（通知使用者）")
-                _notify(f"mailbox-router circuit breaker: {reason}")
+                fresh = note_breaker_alert(thread, state)   # 閂鎖：每停滯週期只告警一次
+                log(f"BREAKER {reason} → 暫停投遞 {letter.name}"
+                    + ("（通知使用者）" if fresh else "（已告警，靜音）"))
+                if fresh:
+                    _notify(f"mailbox-router circuit breaker: {reason}")
                 continue
             inbox = parties[to] / "inbox"
             sendcopy = mbox / "send-copy"
