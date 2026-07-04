@@ -65,15 +65,28 @@ that by copy-pasting between terminals is slow and lossy. `mailbox-router` makes
   next start. So when restarting, only kill *your own* poller by name
   (`pkill -f "inbox_poller.sh <name>"`) — a blanket `pkill -f inbox_poller.sh` would also kill
   other sessions' pollers.
-- **Reliable poller relaunch (Stop hook)** — the wake poller is a `run_in_background` task that
-  exits each time it wakes the session, so the session must relaunch it; relying on the model to
-  remember is unreliable. The optional Stop hook (`hooks/stop_relaunch_poller.py`, wired via
-  `hooks/install_stop_hook.py`) blocks turn-end for a participating session whose poller is down and
-  tells the model to relaunch it — turning the manual step into a system guarantee. It only compels
-  the model (a hook-launched detached process can't wake the session), is scoped to participants
-  (`.mailbox-card` or a registry entry for the cwd), blocks at most once per turn (a nudge marker),
-  and fails open. It cannot help a session that has been exited/closed; delivery is launchd-backed
-  regardless.
+- **Supervisor injection wake (primary wake layer)** — the original design woke a session by having
+  its own `run_in_background` poller exit and relying on the harness's task-notification. But a
+  harness SIGTERMs background tasks at turn boundaries, so that poller can never persist, and a hook
+  that force-relaunches it becomes an infinite loop. So wake is decoupled from the poller:
+  `mailbox_supervisor.py` runs in a dedicated terminal pane (immune to the harness and to terminal
+  hibernation; in the multiplexer's lineage so its socket works). Each cycle it writes a heartbeat,
+  and for any party with unprocessed mail it **injects a fixed protocol message into that party's
+  terminal** (its normal turn then reads/replies/archives — the injected text is the protocol
+  instruction only, never letter content). It also revives dead pollers with no model tokens. Pollers
+  may die freely; wake no longer depends on them.
+- **Host-aware injection backends** — the supervisor injects via the party's host: a cmux-native
+  session via `cmux send --surface <surface>`; a tmux-hosted agent (e.g. behind ttyd/web) via
+  `tmux send-keys -t <session>`. Each poller auto-detects its host (`$TMUX` vs a cmux surface id) and
+  reports `wake: {backend, target}` to its registry entry (legacy `cmux_surface` still read). tmux
+  injection also survives the user killing an ephemeral viewer, so a tmux-hosted poller should be
+  started from inside its persistent host (see `skills/join-mailbox/SKILL.md` for onboarding
+  non-Claude agents like OpenCode / Antigravity CLI).
+- **Stop hook = supervisor dead-man switch** — the Stop hook (`hooks/stop_relaunch_poller.py`) no
+  longer force-relaunches the poller (that was the token-burning loop). It is scoped to participants
+  (`.mailbox-card` or a registry cwd), fails open, and blocks turn-end at most once per window ONLY
+  when the supervisor's heartbeat is stale — i.e. it just asks a human to restart the supervisor pane
+  if the wake engine itself has died. Delivery is launchd-backed regardless.
 - **Codex wake adapter (second wake path)** — a Claude Code session self-wakes via `inbox_poller.sh`
   (the poller exits → the harness resumes the live session). An OpenAI Codex CLI participant has no
   such harness hook, so it gets a second wake adapter: a launchd watcher (`WatchPaths` on the Codex
@@ -145,7 +158,7 @@ desc: owns FinMind ingestion (daily + streaming)
 ## Tests
 
 ```bash
-python3 -m pytest -q     # 133 tests, pure stdlib
+python3 -m pytest -q     # 167 tests, pure stdlib
 ```
 
 ## License

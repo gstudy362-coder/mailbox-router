@@ -1,59 +1,35 @@
 #!/usr/bin/env python3
-"""Stop hook — guarantee a participating session relaunches its wake poller.
+"""Stop hook — supervisor 死人開關（治本版，2026-07-03）。
 
-Background: the wake poller is a `run_in_background` task that EXITS each time it
-wakes the session; the session must relaunch it. Relying on the model to remember
-is unreliable, so this hook runs at end-of-turn and, for a participating session
-whose poller is not running, BLOCKS the stop and tells the model to relaunch it.
-It deliberately does NOT launch the poller itself — only a model-created
-run_in_background task emits the task-notification that wakes the session; a
-hook-launched detached process could heartbeat but never wake.
+背景：喚醒原本靠「session 自己的 run_in_background poller exit → harness 通知」。但
+**harness 在回合邊界就會 SIGTERM 背景 task**，poller 注定被殺；舊版 hook 逼 session
+重啟 poller → 又被殺 → 逼啟 → …… 無限循環燒 token（2026-07-02 事故根因）。
 
-Safety:
-- scoped to participants only (a `.mailbox-card` in cwd, or a registry entry whose
-  cwd matches this session);
-- loop guard: blocks at most once per NUDGE_WINDOW (a fresh `.poller_relaunch_nudge`
-  marker in the mailbox; also honors stdin `stop_hook_active` if present);
-- FAIL OPEN: any error / indeterminate state -> exit 0 (allow the stop). Never trap
-  a session in an un-endable turn.
+治本：喚醒改由 supervisor（跑在專屬 cmux pane，harness/hibernation 都殺不到）對 session
+的 cmux surface 注入。poller 不再是喚醒命脈，愛死就死。因此本 hook **不再逼啟 poller**，
+改為只確保「喚醒機制本身（supervisor）活著」：
 
-Decision logic is pure and unit-tested in tests/test_stop_hook.py.
+- 參與 mailbox 的 session 回合結束時，若 supervisor 心跳新鮮 → 放行（poller 死不死無所謂）。
+- 若 supervisor 心跳斷了 → block 一次，提醒人工重開 supervisor pane（每 NUDGE_WINDOW 一次，
+  不循環——supervisor 在 pane 裡很穩，這個 block 幾乎不會發生）。
+- FAIL OPEN：任何錯誤/判不出 → 放行。
 
-Wire it into ~/.claude/settings.json with hooks/install_stop_hook.py.
+決策邏輯純函式、單元測試在 tests/test_stop_hook.py。
 """
 import json
 import os
 import re
-import subprocess
 import sys
 import time
 from pathlib import Path
 
 ROUTER_DIR = Path(__file__).resolve().parent.parent
-STATE_DIR = ROUTER_DIR / ".state" / "registry"
-NUDGE_WINDOW = 90  # seconds — block at most once per window (loop guard)
-
-# Optional: map a repo directory name -> a stable session <name>, for cases where
-# the poller's <name> differs from the repo's directory name. Empty by default;
-# the fallback is the normalized directory basename. Add your own entries if needed.
-SEED_NAME_MAP = {}
-
-
-def _norm(s):
-    return re.sub(r"[^a-z0-9_-]", "-", s.lower()).strip("-")
-
-
-def resolve_name(cwd, registry_entries):
-    """Name this session's poller runs under: registry cwd-match wins, else seed
-    map, else normalized basename."""
-    cwd = str(cwd).rstrip("/")
-    for e in registry_entries:
-        if str(e.get("cwd", "")).rstrip("/") == cwd:
-            return e["name"]
-    base = os.path.basename(cwd)
-    if base in SEED_NAME_MAP:
-        return SEED_NAME_MAP[base]
-    return _norm(base)
+STATE_DIR = ROUTER_DIR / ".state"
+REGISTRY_DIR = STATE_DIR / "registry"
+HEARTBEAT = STATE_DIR / "supervisor.heartbeat"
+NUDGE = STATE_DIR / ".supervisor_down_nudge"
+HEARTBEAT_WINDOW = 180   # 心跳超過此秒數視為 supervisor 死
+NUDGE_WINDOW = 600       # supervisor 死時，最多每 10 分鐘提醒一次
 
 
 def is_participant(card_exists, cwd, registry_cwds):
@@ -65,71 +41,63 @@ def is_participant(card_exists, cwd, registry_cwds):
     return any(str(c).rstrip("/") == cwd for c in registry_cwds)
 
 
-def decide_block(is_participant, poller_running, recently_nudged):
-    """Return a reason string to block the stop, or None to allow it."""
+def supervisor_alive(hb_mtime, now, window=HEARTBEAT_WINDOW):
+    """supervisor 心跳是否新鮮（None＝從未心跳＝死）。"""
+    if hb_mtime is None:
+        return False
+    return (now - hb_mtime) < window
+
+
+def decide_block(is_participant, supervisor_alive, recently_nudged):
+    """回 block reason 或 None。死人開關：只有『參與方 且 supervisor 死 且 未剛提醒』才 block。"""
     if not is_participant:
         return None
-    if poller_running:
+    if supervisor_alive:
         return None
     if recently_nudged:
         return None
     return (
-        "Your inbox poller is not running — the next letter will not wake you. "
-        "Relaunch it now via the Bash tool with run_in_background:true (see /poller "
-        "step 5), then finish this turn."
+        "mailbox supervisor 沒在跑——你（及其他 session）不會被信件注入喚醒。"
+        "請在一個專屬 cmux 終端 pane 重開它：\n"
+        "指令：python3 %s/mailbox_supervisor.py" % ROUTER_DIR
     )
 
 
 # --- I/O helpers (fail-open) ------------------------------------------------
 
-def _read_registry_entries():
-    entries = []
+def _registry_cwds():
+    out = []
     try:
-        for f in STATE_DIR.glob("*.json"):
+        for f in REGISTRY_DIR.glob("*.json"):
             try:
-                entries.append(json.loads(f.read_text()))
+                out.append(json.loads(f.read_text()).get("cwd", ""))
             except Exception:
                 continue
     except Exception:
         pass
-    return entries
+    return out
 
 
-def _poller_running(name):
+def _heartbeat_mtime():
     try:
-        r = subprocess.run(
-            ["pgrep", "-f", "inbox_poller.sh %s" % name],
-            capture_output=True, text=True, timeout=5,
-        )
-        return r.returncode == 0 and r.stdout.strip() != ""
-    except Exception:
-        return True  # can't tell -> assume running, do NOT block
+        return HEARTBEAT.stat().st_mtime
+    except OSError:
+        return None
 
 
-def _mailbox_for(cwd, entries):
-    cwd = str(cwd).rstrip("/")
-    for e in entries:
-        if str(e.get("cwd", "")).rstrip("/") == cwd:
-            mb = e.get("mailbox_path")
-            if mb:
-                return mb
-    return str(Path(cwd) / "mailbox")
-
-
-def _recently_nudged(mbox):
+def _recently_nudged():
     try:
-        marker = Path(mbox) / ".poller_relaunch_nudge"
-        if marker.exists():
-            return (time.time() - marker.stat().st_mtime) < NUDGE_WINDOW
+        if NUDGE.exists():
+            return (time.time() - NUDGE.stat().st_mtime) < NUDGE_WINDOW
     except Exception:
         pass
     return False
 
 
-def _touch_nudge(mbox):
+def _touch_nudge():
     try:
-        Path(mbox).mkdir(parents=True, exist_ok=True)
-        (Path(mbox) / ".poller_relaunch_nudge").touch()
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        NUDGE.touch()
     except Exception:
         pass
 
@@ -138,24 +106,17 @@ def main():
     try:
         data = json.load(sys.stdin)
     except Exception:
-        return 0  # unparseable input -> allow
+        return 0
     try:
         cwd = data.get("cwd") or os.getcwd()
-        stop_hook_active = bool(data.get("stop_hook_active", False))
-        entries = _read_registry_entries()
-        registry_cwds = [e.get("cwd", "") for e in entries]
         card_exists = (Path(cwd) / ".mailbox-card").exists()
-        if not is_participant(card_exists, cwd, registry_cwds):
+        participant = is_participant(card_exists, cwd, _registry_cwds())
+        if not participant:
             return 0
-        name = resolve_name(cwd, entries)
-        mbox = _mailbox_for(cwd, entries)
-        recently = stop_hook_active or _recently_nudged(mbox)
-        reason = decide_block(is_participant(card_exists, cwd, registry_cwds),
-                              _poller_running(name), recently)
+        alive = supervisor_alive(_heartbeat_mtime(), time.time())
+        reason = decide_block(participant, alive, _recently_nudged())
         if reason:
-            cmd = "bash %s/inbox_poller.sh %s %s" % (ROUTER_DIR, name, mbox)
-            reason = reason + "\nCommand: " + cmd
-            _touch_nudge(mbox)
+            _touch_nudge()
             print(json.dumps({"decision": "block", "reason": reason}))
         return 0
     except Exception:

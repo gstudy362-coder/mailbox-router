@@ -64,11 +64,29 @@ touch "$INFLIGHT"
 # 身份行（可診斷性）：任何異常退出時，task output 至少留下 name/pid/mbox/起始時間可比對。
 echo "▶ poller name=$NAME pid=$$ mbox=$MBOX start=$(date '+%m-%d %H:%M:%S')"
 
+# host-aware 喚醒目標自報：poller 在該 session 的持久宿主內跑，自主判斷宿主 → 報 (backend,
+# target) 給 registry，供 supervisor 注入喚醒。$TMUX → tmux session 名；否則 CMUX_SURFACE_ID →
+# cmux surface；都沒有 → 空（走通用底層）。每輪重抓＝session 改名/搬 tab 自癒。
+# ⚠ tmux-hosted 的請從 tmux session 內啟動，別從外層觀景窗，否則會報成會 stale 的 surface。
+detect_wake() {  # echo "<backend> <target>"
+  if [ -n "${TMUX:-}" ]; then
+    echo "tmux $(tmux display-message -p '#S' 2>/dev/null)"
+  elif [ -n "${CMUX_SURFACE_ID:-}" ]; then
+    echo "cmux ${CMUX_SURFACE_ID}"
+  else
+    local s; s="$(cmux identify --id-format uuids 2>/dev/null | python3 -c 'import json,sys
+try: print(json.load(sys.stdin)["caller"]["surface_id"])
+except Exception: pass' 2>/dev/null)"
+    [ -n "$s" ] && echo "cmux $s" || echo " "
+  fi
+}
+
 for i in $(seq 1 "$MAX_CYCLES"); do
   # 報到＋保活：由 registry CLI 寫/更新自己的 entry（含自宣告能力 roles/description、
   # last_seen 每輪推進＝保活）。entry 內容全權由 CLI 負責，poller 不再自組 JSON。
+  read -r WB WT <<< "$(detect_wake)"
   python3 "$REGISTRY" write-self --name "$NAME" --mailbox "$MBOX" \
-    --cwd "$PWD" --pid $$ >/dev/null 2>&1 || true
+    --cwd "$PWD" --pid $$ --wake-backend "${WB:-}" --wake-target "${WT:-}" >/dev/null 2>&1 || true
 
   python3 "$ROUTER" --once >/dev/null 2>&1   # 投遞（雙向 outbox→inbox）
   now="$(date +%s)"

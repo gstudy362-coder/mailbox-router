@@ -142,7 +142,8 @@ def classify(entry: dict, now: int, has_inflight: bool) -> str:
 
 def write_entry(state_dir, name: str, mailbox_path: str, cwd: str,
                 pid: int, now: int, roles: Optional[List[str]] = None,
-                description: str = "") -> Path:
+                description: str = "", surface: str = "",
+                wake_backend: str = "", wake_target: str = "") -> Path:
     """落 <name>.json（自建 registry/ 目錄、同名覆寫），回寫入路徑。
 
     寫入內容可被 read_registry 原樣讀回（roundtrip）。
@@ -159,6 +160,21 @@ def write_entry(state_dir, name: str, mailbox_path: str, cwd: str,
         "roles": list(roles) if roles else [],
         "description": str(description),
     }
+    # 喚醒目標（host-aware）：優先用 (wake_backend, wake_target)；--surface 為 cmux 別名。
+    if not wake_backend and surface:
+        wake_backend, wake_target = "cmux", surface
+    if wake_backend and wake_target:
+        entry["wake"] = {"backend": str(wake_backend), "target": str(wake_target)}
+    else:
+        # 無 target 的心跳（如 detached poller，無宿主 context）不得擦掉先前自報的 wake target。
+        try:
+            prev = json.loads(path.read_text())
+            if prev.get("wake"):
+                entry["wake"] = prev["wake"]
+            elif prev.get("cmux_surface"):
+                entry["wake"] = {"backend": "cmux", "target": prev["cmux_surface"]}
+        except (OSError, ValueError):
+            pass
     path.write_text(json.dumps(entry, ensure_ascii=False))
     return path
 
@@ -181,7 +197,9 @@ def _cmd_write_self(args) -> int:
     roles = parse_roles(os.environ.get("MAILBOX_ROLES", ""), card)
     description = parse_description(os.environ.get("MAILBOX_DESC", ""), card)
     write_entry(STATE_DIR, args.name, args.mailbox, args.cwd, args.pid,
-                now=int(time.time()), roles=roles, description=description)
+                now=int(time.time()), roles=roles, description=description,
+                surface=args.surface, wake_backend=args.wake_backend,
+                wake_target=args.wake_target)
     return 0
 
 
@@ -195,6 +213,9 @@ def _main(argv=None) -> int:
     ws.add_argument("--mailbox", required=True)
     ws.add_argument("--cwd", required=True)
     ws.add_argument("--pid", required=True, type=int)
+    ws.add_argument("--surface", default="")
+    ws.add_argument("--wake-backend", dest="wake_backend", default="")
+    ws.add_argument("--wake-target", dest="wake_target", default="")
     ws.set_defaults(func=_cmd_write_self)
     args = parser.parse_args(argv)
     return args.func(args)

@@ -23,8 +23,8 @@ def test_registry_path_under_state_registry_dir(tmp_path):
 
 def test_registry_path_normalizes_name_to_safe_charset(tmp_path):
     # 大寫 / 空白 / 斜線等不安全字元 → 收斂到 [a-z0-9_-]
-    p = reg.registry_path(tmp_path, "Service X/v2")
-    assert p.name == "service-x-v2.json"
+    p = reg.registry_path(tmp_path, "Quant Data/v2")
+    assert p.name == "quant-data-v2.json"
     # 仍在 registry/ 底下，無路徑穿越
     assert p.parent == tmp_path / "registry"
 
@@ -337,3 +337,58 @@ def test_write_self_cli_missing_card_yields_empty(tmp_path):
     e = reg.read_registry(tmp_path)["bare"]
     assert e["roles"] == []
     assert e["description"] == ""
+
+
+# ---------- cmux surface 自報（supervisor-script-wake） ----------
+
+def test_write_entry_with_surface_records_field(tmp_path):
+    # --surface 為 cmux 別名 → 記成 wake:{cmux, <surface>}
+    p = reg.write_entry(tmp_path, "x", "/mb", "/cwd", 1, now=10,
+                             surface="9C447FDD-ACB4-4794-AACC-9477AA3D8060")
+    import json
+    e = json.loads(p.read_text())
+    assert e["wake"] == {"backend": "cmux", "target": "9C447FDD-ACB4-4794-AACC-9477AA3D8060"}
+
+
+def test_write_entry_without_surface_omits_field(tmp_path):
+    p = reg.write_entry(tmp_path, "x", "/mb", "/cwd", 1, now=10)
+    import json
+    assert "cmux_surface" not in json.loads(p.read_text())
+
+
+def test_write_entry_empty_surface_preserves_existing(tmp_path):
+    # launchd 生的 detached poller 沒 cmux context → identify 空；心跳不得擦掉
+    # session 先前自報的 surface（supervisor 的注入目標）。
+    reg.write_entry(tmp_path, "x", "/mb", "/cwd", 1, now=10, surface="KEEP-ME")
+    reg.write_entry(tmp_path, "x", "/mb", "/cwd", 2, now=20)   # 無 target 的心跳
+    import json
+    e = json.loads((tmp_path / "registry" / "x.json").read_text())
+    assert e["wake"] == {"backend": "cmux", "target": "KEEP-ME"}
+
+
+# ---------- host-aware wake target（tmux/cmux backend）----------
+
+def test_write_entry_records_wake_tmux(tmp_path):
+    p = reg.write_entry(tmp_path, "agy", "/mb", "/cwd", 1, now=10,
+                        wake_backend="tmux", wake_target="agy-abc")
+    import json
+    e = json.loads(p.read_text())
+    assert e["wake"] == {"backend": "tmux", "target": "agy-abc"}
+
+def test_write_entry_records_wake_cmux(tmp_path):
+    p = reg.write_entry(tmp_path, "x", "/mb", "/cwd", 1, now=10,
+                        wake_backend="cmux", wake_target="SURF")
+    import json
+    assert json.loads(p.read_text())["wake"] == {"backend": "cmux", "target": "SURF"}
+
+def test_write_entry_surface_alias_maps_to_cmux_wake(tmp_path):
+    # 舊 --surface 相容：等同 cmux backend
+    p = reg.write_entry(tmp_path, "x", "/mb", "/cwd", 1, now=10, surface="SURF")
+    import json
+    e = json.loads(p.read_text())
+    assert e.get("wake") == {"backend": "cmux", "target": "SURF"} or e.get("cmux_surface") == "SURF"
+
+def test_write_entry_no_wake_when_none(tmp_path):
+    p = reg.write_entry(tmp_path, "x", "/mb", "/cwd", 1, now=10)
+    import json
+    assert "wake" not in json.loads(p.read_text())
