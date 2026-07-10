@@ -217,7 +217,7 @@ def test_delivery_stream_after_terminal_never_trips():
     state = {}
     r.record_stage(state, "t", "dashboard", "done")          # hwm4, turns0
     for _ in range(r.MAX_NOPROGRESS_TURNS + 5):
-        r.record_stage(state, "t", "service-a", "deliver")
+        r.record_stage(state, "t", "quant-analysis", "deliver")
         tripped, _ = r.breaker_check("t", state, max_turns=r.MAX_NOPROGRESS_TURNS)
         assert tripped is False
     assert state["thread_turns"]["t"] == 0
@@ -228,7 +228,7 @@ def test_block_stream_still_trips_after_terminal():
     state = {}
     r.record_stage(state, "t", "dashboard", "done")          # hwm4
     for _ in range(r.MAX_NOPROGRESS_TURNS):
-        r.record_stage(state, "t", "service-a", "block")
+        r.record_stage(state, "t", "quant-analysis", "block")
     tripped, _ = r.breaker_check("t", state, max_turns=r.MAX_NOPROGRESS_TURNS)
     assert tripped is True
 
@@ -245,7 +245,7 @@ def test_breaker_alert_latches_once_per_stall():
 def test_progress_re_arms_breaker_alert():
     state = {}
     r.note_breaker_alert("t", state)                     # 已告警、閂鎖
-    r.record_stage(state, "t", "service-a", "deliver")   # 推進 → 歸零並清閂鎖
+    r.record_stage(state, "t", "quant-analysis", "deliver")  # 推進 → 歸零並清閂鎖
     assert state.get("thread_alerted", {}).get("t") in (None, False)
     assert r.note_breaker_alert("t", state) is True      # 停滯解除後可再告警
 
@@ -406,6 +406,126 @@ def test_deliver_to_unknown_party_holds_outbox_and_alerts(tmp_path, monkeypatch)
     assert any("ghost" in c.lower() for c in calls)
 
 
+def test_deliver_headerless_letter_holds_outbox_and_alerts(tmp_path, monkeypatch):
+    # 缺 TO 標頭 → 不猜「另一方」、不投、留 outbox、告警點名寄件方（治舊 fallback 誤投）
+    qd, db = _tmp_mailboxes(tmp_path, monkeypatch)
+    calls = []
+    monkeypatch.setattr(r, "_notify", lambda m: calls.append(m))
+    (qd / "outbox" / "no-header.md").write_text(
+        "THREAD: orphan\nSTAGE: ask\n\n忘了寫 TO 的信")
+    state = {"delivered": [], "thread_turns": {}}
+    r.deliver_new_letters(state, dry_run=False)
+    # 信仍躺 sender outbox（未投遞）
+    assert (qd / "outbox" / "no-header.md").exists()
+    # 絕不 fallback 投給另一個 seed 方（dashboard）
+    assert not (db / "inbox" / "no-header.md").exists()
+    # 觸發 user-visible 告警，且訊息點名寄件方
+    assert calls, "缺 TO 標頭應觸發告警"
+    assert any("service-a" in c for c in calls)
+
+
+def test_stuck_letter_alerts_once_not_every_cycle(tmp_path, monkeypatch):
+    # 未知收件方的卡住信連掃多輪只告警一次，其後靜音（治 Telegram 每輪轟炸）
+    qd, db = _tmp_mailboxes(tmp_path, monkeypatch)
+    calls = []
+    monkeypatch.setattr(r, "_notify", lambda m: calls.append(m))
+    (qd / "outbox" / "stuck.md").write_text("TO: ghost\nTHREAD: x\nSTAGE: ask\n\n卡住")
+    state = {"delivered": [], "thread_turns": {}}
+    for _ in range(3):
+        r.deliver_new_letters(state, dry_run=False)
+    assert len(calls) == 1, f"卡住信只該告警一次，實際 {len(calls)}"
+    assert (qd / "outbox" / "stuck.md").exists()   # 仍未投遞
+
+
+def test_headerless_alerts_once_not_every_cycle(tmp_path, monkeypatch):
+    # 缺 TO 的卡住信同樣只告警一次（同一個閂鎖）
+    qd, db = _tmp_mailboxes(tmp_path, monkeypatch)
+    calls = []
+    monkeypatch.setattr(r, "_notify", lambda m: calls.append(m))
+    (qd / "outbox" / "noheader.md").write_text("THREAD: x\nSTAGE: ask\n\n沒 TO")
+    state = {"delivered": [], "thread_turns": {}}
+    for _ in range(3):
+        r.deliver_new_letters(state, dry_run=False)
+    assert len(calls) == 1, f"缺 TO 卡住信只該告警一次，實際 {len(calls)}"
+
+
+def test_stuck_alert_rearms_after_letter_removed(tmp_path, monkeypatch):
+    # 卡住信被處理掉 → 閂鎖收斂；同信再現時可重新告警一次（不被永久靜音）
+    qd, db = _tmp_mailboxes(tmp_path, monkeypatch)
+    calls = []
+    monkeypatch.setattr(r, "_notify", lambda m: calls.append(m))
+    letter = qd / "outbox" / "stuck.md"
+    letter.write_text("TO: ghost\nTHREAD: x\nSTAGE: ask\n\n卡住")
+    state = {"delivered": [], "thread_turns": {}}
+    r.deliver_new_letters(state, dry_run=False)   # 告警 #1
+    letter.unlink()                                # 使用者處理掉
+    r.deliver_new_letters(state, dry_run=False)   # 空掃 → 閂鎖 prune
+    letter.write_text("TO: ghost\nTHREAD: x\nSTAGE: ask\n\n卡住")  # 又出現
+    r.deliver_new_letters(state, dry_run=False)   # 告警 #2（重新武裝）
+    assert len(calls) == 2, f"再現應重新告警，實際 {len(calls)}"
+
+
+# ---------- 退信 NDR（Layer 2：未知收件方/缺 TO → 退回寄件方 inbox，3 輪上限）----------
+
+def test_unknown_recipient_bounces_to_sender_with_suggestion(tmp_path, monkeypatch):
+    qd, db = _tmp_mailboxes(tmp_path, monkeypatch)
+    monkeypatch.setattr(r, "_notify", lambda m: None)
+    # service-a 把收件人拼成 dashbord（正規名 dashboard，未註冊的 dashbord）
+    (qd / "outbox" / "greet.md").write_text("TO: dashbord\nTHREAD: t\nSTAGE: ask\n\nhi")
+    state = {"delivered": [], "thread_turns": {}}
+    r.deliver_new_letters(state, dry_run=False)
+    bounces = list((qd / "inbox").glob("*.md"))
+    assert bounces, "應退信到寄件方自己的 inbox"
+    txt = bounces[0].read_text()
+    assert "reject" in txt.lower()          # STAGE reject
+    assert "dashbord" in txt                # 點名寫錯的收件人
+    assert "dashboard" in txt               # difflib 近似名建議（非 dashbord 子字串→證明有加建議）
+    assert "greet.md" in txt                # 原檔名
+    assert (qd / "outbox" / "greet.md").exists()   # 原信仍留 outbox
+
+
+def test_bounce_capped_at_three_rounds(tmp_path, monkeypatch):
+    qd, db = _tmp_mailboxes(tmp_path, monkeypatch)
+    monkeypatch.setattr(r, "_notify", lambda m: None)
+    content = "TO: nobody\nTHREAD: t\nSTAGE: ask\n\nhi"
+    (qd / "outbox" / "x.md").write_text(content)
+    mid = r.message_id(content)
+    state = {"delivered": [], "thread_turns": {}}
+    for _ in range(5):
+        r.deliver_new_letters(state, dry_run=False)
+    assert state["bounce_count"][mid] == 3, \
+        f"退信上限 3，實際 {state['bounce_count'].get(mid)}"
+
+
+def test_bounce_converges_and_rearms(tmp_path, monkeypatch):
+    qd, db = _tmp_mailboxes(tmp_path, monkeypatch)
+    monkeypatch.setattr(r, "_notify", lambda m: None)
+    content = "TO: nobody\nTHREAD: t\nSTAGE: ask\n\nhi"
+    letter = qd / "outbox" / "x.md"
+    letter.write_text(content)
+    mid = r.message_id(content)
+    state = {"delivered": [], "thread_turns": {}}
+    r.deliver_new_letters(state, dry_run=False)          # count=1
+    assert state["bounce_count"][mid] == 1
+    letter.unlink()
+    r.deliver_new_letters(state, dry_run=False)          # 空掃 → 收斂
+    assert mid not in state.get("bounce_count", {})
+    letter.write_text(content)                            # 同信再現
+    r.deliver_new_letters(state, dry_run=False)          # 重新退 count=1
+    assert state["bounce_count"][mid] == 1
+
+
+def test_missing_to_bounces_to_sender(tmp_path, monkeypatch):
+    qd, db = _tmp_mailboxes(tmp_path, monkeypatch)
+    monkeypatch.setattr(r, "_notify", lambda m: None)
+    (qd / "outbox" / "noto.md").write_text("THREAD: t\nSTAGE: ask\n\n沒寫 TO")
+    state = {"delivered": [], "thread_turns": {}}
+    r.deliver_new_letters(state, dry_run=False)
+    bounces = list((qd / "inbox").glob("*.md"))
+    assert bounces, "缺 TO 也應退信到寄件方 inbox"
+    assert "noto.md" in bounces[0].read_text()
+
+
 def test_registered_party_can_send(tmp_path, monkeypatch):
     # N-way 核心：已註冊的新方不只能收，也能寄（掃描迴圈須吃 resolve_parties）
     import registry as reg
@@ -420,3 +540,19 @@ def test_registered_party_can_send(tmp_path, monkeypatch):
     r.deliver_new_letters(state, dry_run=False)
     assert (db / "inbox" / "foo-sends.md").exists()           # 新方寄出 → 投到 dashboard
     assert not (foo_mbox / "outbox" / "foo-sends.md").exists()  # foo outbox 已清
+
+
+# ---------- single-flight skip 可診斷（log 印持鎖者 pid）----------
+
+def test_singleflight_holder_reads_lock_pid(tmp_path, monkeypatch):
+    lock = tmp_path / "router.lock"
+    lock.write_text("12345")
+    monkeypatch.setattr(r, "LOCK_FILE", lock)
+    assert r.singleflight_holder() == "12345"
+
+def test_singleflight_holder_unreadable_is_question_mark(tmp_path, monkeypatch):
+    monkeypatch.setattr(r, "LOCK_FILE", tmp_path / "no-such.lock")
+    assert r.singleflight_holder() == "?"
+    bad = tmp_path / "bad.lock"; bad.write_text("garbage")
+    monkeypatch.setattr(r, "LOCK_FILE", bad)
+    assert r.singleflight_holder() == "?"

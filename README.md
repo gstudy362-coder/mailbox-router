@@ -55,6 +55,15 @@ that by copy-pasting between terminals is slow and lossy. `mailbox-router` makes
   (via `.mailbox-card` or env). When deciding *who* should do a task, the sending session reads the
   registry, reasons about the best recipient, **confirms with the human**, and sends one letter per
   recipient (complex tasks are decomposed into tailored letters). The router stays strictly by-name.
+- **Undeliverable mail bounces back (NDR)** — the router never guesses a recipient: a letter with no
+  `TO:` header, or a `TO:` naming an unregistered party, is held in the sender's outbox and a
+  **bounce letter (`STAGE: reject`) is delivered into the sender's own inbox** — so the *sending
+  agent* is actively woken and told what's wrong, with a closest-registered-name suggestion for
+  typos (`TO: service-a-collector` → "did you mean `service-a`?"). The same stuck letter bounces at
+  most 3 rounds, then goes quiet; resolving it (removing/fixing the letter) re-arms the counter. A
+  single latched operator alert per stuck letter remains as a backstop (no per-cycle alert storms).
+  Senders are expected to check the registry for the exact `name` before addressing a letter
+  (see `skills/join-mailbox/SKILL.md`).
 - **Read-only TUI** — `python3 dashboard_tui.py` shows who's online (with roles), each thread's
   current stage (who's waiting on whom), router health, and stuck mail. It never writes state.
 - **Stuck-mail watcher** — a launchd-resident watcher scans every registered party's inbox and
@@ -87,6 +96,18 @@ that by copy-pasting between terminals is slow and lossy. `mailbox-router` makes
   (`.mailbox-card` or a registry cwd), fails open, and blocks turn-end at most once per window ONLY
   when the supervisor's heartbeat is stale — i.e. it just asks a human to restart the supervisor pane
   if the wake engine itself has died. Delivery is launchd-backed regardless.
+  - *Serial-kill backoff*: if the harness keeps killing pollers right after relaunch (e.g. two
+    processes attached to one session reaping each other's background tasks), the hook counts
+    consecutive kills (reset while a poller stays alive); after 3 it switches to a 30-minute
+    backoff alert asking a human to check the session state, instead of fueling a
+    kill→block→relaunch→kill loop across turns. The stuck-mail watcher remains the safety net.
+- **Stray-outbox scan & diagnosable skips** — letters written into a *non-registered*
+  `mailbox/outbox/` (a decoy mailbox the router never scans) would go silently stale; the watcher
+  additionally scans `*/mailbox/outbox/*.md` two levels under the workspace, excludes registered
+  mailboxes, and alerts after 15 minutes ("move the letter or register that mailbox"), with the
+  same latch/re-arm semantics as stuck-inbox alerts. The router's single-flight skip log also
+  prints the lock holder's pid (`holder pid=<N>`), so a benign collision and a wedged holder are
+  distinguishable at a glance.
 - **Codex wake adapter (second wake path)** — a Claude Code session self-wakes via `inbox_poller.sh`
   (the poller exits → the harness resumes the live session). An OpenAI Codex CLI participant has no
   such harness hook, so it gets a second wake adapter: a launchd watcher (`WatchPaths` on the Codex

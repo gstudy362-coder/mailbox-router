@@ -139,6 +139,7 @@ def test_run_cycle_alerts_on_stuck_letter_and_persists(tmp_path, monkeypatch):
 
     state_dir = tmp_path / ".state"
     monkeypatch.setattr(w, "STATE_DIR", state_dir)
+    monkeypatch.setattr(w, "WORKSPACE", tmp_path)  # sandbox stray-outbox 掃描，勿讀真實 workspace
     monkeypatch.setattr(w, "ALERTS_FILE", state_dir / "stuck_alerts.json")
     # 註冊表：foo → foo_mbox
     monkeypatch.setattr(w, "known_parties", lambda: {"foo": str(foo_mbox)})
@@ -166,6 +167,7 @@ def test_run_cycle_no_alert_when_letter_fresh(tmp_path, monkeypatch):
 
     state_dir = tmp_path / ".state"
     monkeypatch.setattr(w, "STATE_DIR", state_dir)
+    monkeypatch.setattr(w, "WORKSPACE", tmp_path)  # sandbox stray-outbox 掃描，勿讀真實 workspace
     monkeypatch.setattr(w, "ALERTS_FILE", state_dir / "stuck_alerts.json")
     monkeypatch.setattr(w, "known_parties", lambda: {"foo": str(foo_mbox)})
     monkeypatch.setattr(w, "run_delivery", lambda: None)
@@ -189,6 +191,7 @@ def test_run_cycle_clears_alert_when_letter_gone(tmp_path, monkeypatch):
         json.dumps({_letter_key("foo", "gone.md"): 12345}))
 
     monkeypatch.setattr(w, "STATE_DIR", state_dir)
+    monkeypatch.setattr(w, "WORKSPACE", tmp_path)  # sandbox stray-outbox 掃描，勿讀真實 workspace
     monkeypatch.setattr(w, "ALERTS_FILE", state_dir / "stuck_alerts.json")
     monkeypatch.setattr(w, "known_parties", lambda: {"foo": str(foo_mbox)})
     monkeypatch.setattr(w, "run_delivery", lambda: None)
@@ -211,6 +214,7 @@ def test_run_cycle_never_moves_or_reads_letters(tmp_path, monkeypatch):
 
     state_dir = tmp_path / ".state"
     monkeypatch.setattr(w, "STATE_DIR", state_dir)
+    monkeypatch.setattr(w, "WORKSPACE", tmp_path)  # sandbox stray-outbox 掃描，勿讀真實 workspace
     monkeypatch.setattr(w, "ALERTS_FILE", state_dir / "stuck_alerts.json")
     monkeypatch.setattr(w, "known_parties", lambda: {"foo": str(foo_mbox)})
     monkeypatch.setattr(w, "run_delivery", lambda: None)
@@ -231,3 +235,28 @@ def test_known_parties_includes_seed_even_with_empty_registry(tmp_path, monkeypa
     monkeypatch.setattr(mr, "STATE_DIR", tmp_path / ".state")  # 無 registry/ → resolve==seed
     kp = w.known_parties()
     assert "service-a" in kp and "dashboard" in kp
+
+
+# ---------- stray outbox（非註冊路徑的 outbox 滯留信告警）----------
+
+REG = ["/ws/service-a/mailbox", "/ws/mailbox-router/mailbox"]
+
+def test_stray_letter_over_threshold_is_flagged():
+    now = 10_000
+    files = [("/ws/service-a/finmind_replacement/mailbox/outbox/lost.md", 8_000)]
+    out = w.stray_outbox_letters(files, REG, now=now, threshold=900)
+    assert [p for p, _ in out] == ["/ws/service-a/finmind_replacement/mailbox/outbox/lost.md"]
+
+def test_registered_outbox_is_never_stray():
+    # 合法 outbox 裡等投遞的信（就算老）不是 stray
+    now = 10_000
+    files = [("/ws/service-a/mailbox/outbox/waiting.md", 100)]
+    assert w.stray_outbox_letters(files, REG, now=now, threshold=900) == []
+
+def test_stray_letter_under_threshold_not_yet_flagged():
+    now = 10_000
+    files = [("/ws/foo/sub/mailbox/outbox/fresh.md", 9_500)]   # age 500 < 900
+    assert w.stray_outbox_letters(files, REG, now=now, threshold=900) == []
+
+def test_stray_key_prefix():
+    assert w.stray_key("/x/mailbox/outbox/a.md").startswith("stray/")

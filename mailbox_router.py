@@ -16,6 +16,8 @@ sha1 去重 + circuit breaker（單 thread 往返上限）+ single-flight 鎖兜
 from __future__ import annotations
 
 import argparse
+import difflib
+import os
 import hashlib
 import json
 import re
@@ -23,7 +25,6 @@ import shutil
 import time
 from datetime import datetime
 from pathlib import Path
-import os
 
 import registry  # M1：動態 session 註冊表（read_registry / write_entry / classify）
 
@@ -100,8 +101,8 @@ def record_stage(state: dict, thread: str, party: str, stage: str) -> None:
     if raised:
         state["thread_hwm"][thread] = rank
     # 推進 = 抬高水位（raised）或 出貨/收尾信（rank≥deliver）。後者讓「終結後仍活躍
-    # 的串流」(hwm 已飽和) 不再誤觸——出一封即算推進、turns 歸零。只有非出貨非推進的
-    # ask/accept/block 才累加。推進同時清告警閂鎖（停滯解除 → 可再次告警）。
+    # 的串流」(hwm 已飽和) 不再誤觸——出一張 widget 就算推進、turns 歸零。只有非出貨
+    # 非推進的 ask/accept/block 才累加。推進同時清告警閂鎖（停滯解除 → 可再次告警）。
     if raised or rank >= DELIVER_RANK:
         state["thread_turns"][thread] = 0
         state.get("thread_alerted", {}).pop(thread, None)
@@ -115,6 +116,74 @@ def note_breaker_alert(thread: str, state: dict) -> bool:
         return False
     alerted[thread] = True
     return True
+
+
+def note_stray_alert(mid: str, state: dict) -> bool:
+    """卡住信（未知收件方／缺 TO）告警閂鎖：同一封信只在首次回 True（告警），
+    其後回 False（靜音），避免每輪 router 掃到投不出去的信就重複 _notify（Telegram 轟炸）。
+    收斂由 deliver_new_letters 末尾按『本輪仍卡住』prune——信被處理掉後 id 移除，
+    同信再現可重新告警一次。"""
+    alerted = state.setdefault("stray_alerted", [])
+    if mid in alerted:
+        return False
+    alerted.append(mid)
+    return True
+
+
+BOUNCE_MAX_ROUNDS = 3   # 同一封投不出去的信最多退幾輪（達此即止，避免無限退信）
+
+
+def bounce_round(mid: str, state: dict) -> int:
+    """退信輪次計數：回傳這封信「本次該退的輪次」(1..BOUNCE_MAX_ROUNDS)；達上限回 0（不再退）。
+    收斂由 deliver_new_letters 末尾按『本輪仍卡住』prune——信離開 outbox 後計數清除、同信再現重數。"""
+    counts = state.setdefault("bounce_count", {})
+    n = counts.get(mid, 0)
+    if n >= BOUNCE_MAX_ROUNDS:
+        return 0
+    counts[mid] = n + 1
+    return n + 1
+
+
+def _bounce_body(letter_name: str, to, parties) -> str:
+    """退信內文：點名錯誤、指向註冊表；未知收件方另附 difflib 近似正規名建議。"""
+    if to:
+        sugg = difflib.get_close_matches(to, list(parties), n=2, cutoff=0.5)
+        hint = (f"（你是不是要寄給 {' 或 '.join('`' + s + '`' for s in sugg)}？）"
+                if sugg else "")
+        return (f"你寄的信 '{letter_name}' 的收件人 '{to}' 不在註冊表{hint}。\n"
+                f"寄錯人了——請先看註冊表確認正規 name 再寄："
+                f"cat {STATE_DIR}/registry/*.json")
+    return (f"你寄的信 '{letter_name}' 缺 TO 收件人標頭，無法投遞。\n"
+            f"請補上 TO:<正規name>（先看註冊表確認）再寄："
+            f"cat {STATE_DIR}/registry/*.json")
+
+
+def write_bounce(sender_mbox, party: str, letter_name: str, to, parties,
+                 rnd: int) -> None:
+    """把退信投進『寄件方自己的 inbox』（固定檔名，不在對方 inbox 堆多封）。
+    退信 STAGE=reject、TO=寄件方，讓寄件方被正常喚醒、第一時間看到寄錯了。"""
+    inbox = sender_mbox / "inbox"
+    inbox.mkdir(parents=True, exist_ok=True)
+    content = (f"TO: {party}\nTHREAD: bounce-{letter_name}\nSTAGE: reject\n\n"
+               f"【退信 mailbox-router · round {rnd}/{BOUNCE_MAX_ROUNDS}】\n"
+               f"{_bounce_body(letter_name, to, parties)}\n")
+    (inbox / f"bounced-{letter_name}").write_text(content)
+
+
+def _handle_undeliverable(state, party, mbox, parties, letter_name, to, mid,
+                          dry_run) -> None:
+    """未知收件方／缺 TO 的共同處置：退信回寄件方 inbox（≤BOUNCE_MAX_ROUNDS 輪）
+    ＋人類 Telegram 告警一次（backstop，寄件方離線時仍有人知道）。原信留 outbox（呼叫端不 unlink）。"""
+    label = f"未知收件方 '{to}'" if to else "缺 TO 標頭"
+    rnd = bounce_round(mid, state) if not dry_run else 0
+    if rnd:
+        write_bounce(mbox, party, letter_name, to, parties, rnd)
+    fresh = note_stray_alert(mid, state)   # 人類告警閂鎖：每封只發一次
+    note = (f"退寄件方 {party} round {rnd}" if rnd
+            else ("退信達上限，靜音" if not dry_run else "dry"))
+    log(f"UNDELIVERABLE {label} → 留 outbox 不投 {letter_name}（{note}）")
+    if fresh and not dry_run:
+        _notify(f"mailbox-router: {party} 的信投不出去（{label}，已退回寄件方）：{letter_name}")
 
 
 def is_converged(state: dict, thread: str) -> bool:
@@ -166,6 +235,8 @@ def load_state() -> dict:
     state.setdefault("thread_turns", {})
     state.setdefault("thread_stage", {})
     state.setdefault("thread_hwm", {})
+    state.setdefault("stray_alerted", [])
+    state.setdefault("bounce_count", {})
     return state
 
 
@@ -183,10 +254,6 @@ def log(msg: str) -> None:
 
 
 # ───────────────────────── routing（投遞）─────────────────────
-
-def _other(party: str) -> str:
-    return "dashboard" if party == "service-a" else "service-a"
-
 
 def resolve_parties() -> dict:
     """收件方解析表＝seed 預設（PARTIES，含 service-a/dashboard 已知路徑）
@@ -207,6 +274,7 @@ def deliver_new_letters(state: dict, *, dry_run: bool) -> list:
     """掃兩端 outbox/，投遞未投遞的信到對方 inbox/ + 自己 send-copy/。
     回傳被投遞到的收件方清單（去重）。"""
     recipients = set()
+    seen_stray = set()   # 本輪掃到的卡住信 id（未知收件方／缺 TO）→ 供告警閂鎖收斂
     parties = resolve_parties()   # seed ⊕ 註冊表（註冊表優先）
     # 掃「所有已知方」的 outbox（含動態註冊方）→ 任意在線 session 都能寄，不只 seed 兩方。
     for party, mbox in parties.items():
@@ -220,14 +288,20 @@ def deliver_new_letters(state: dict, *, dry_run: bool) -> list:
                 continue
             hdr = parse_headers(content)
             stage = parse_stage(content)
-            to = hdr["to"] or _other(party)
+            to = hdr["to"]
+            # 缺 TO 標頭 → 不猜收件方（不再 fallback 給另一個 seed 方，那會誤投）。
+            # 退信回寄件方 inbox（≤3 輪）＋留 outbox＋人類告警一次（backstop）。
+            if not to:
+                seen_stray.add(mid)
+                _handle_undeliverable(
+                    state, party, mbox, parties, letter.name, None, mid, dry_run)
+                continue
             # 收件方＝TO:<name> 直接查表（不再寫死兩方收斂）。
-            # 未註冊／路徑未知 → 不投、留 outbox、告警，續下一封。
+            # 未註冊／路徑未知 → 退信回寄件方 inbox（≤3 輪，含近似名建議）＋留 outbox＋人類告警一次。
             if to not in parties:
-                log(f"UNKNOWN recipient '{to}' → 留 outbox 不投 {letter.name}"
-                    f"（通知使用者）")
-                _notify(f"mailbox-router: 未知收件方 '{to}'（從未註冊），"
-                        f"信留 {party} outbox 等待：{letter.name}")
+                seen_stray.add(mid)
+                _handle_undeliverable(
+                    state, party, mbox, parties, letter.name, to, mid, dry_run)
                 continue
             thread = hdr["thread"] or letter.stem
             tripped, reason = breaker_check(thread, state, max_turns=MAX_NOPROGRESS_TURNS)
@@ -257,6 +331,12 @@ def deliver_new_letters(state: dict, *, dry_run: bool) -> list:
                     log(f"DEADLOCK 互等死鎖 thread={thread}（雙方 block）→ 通知使用者")
                     _notify(f"mailbox-router deadlock: thread '{thread}' 雙方互等(block)，需介入")
             recipients.add(to)
+    # 卡住信閂鎖／退信計數收斂：只保留本輪仍卡住的 id；已處理掉的移除 → 同信再現可重新告警/退信。
+    if "stray_alerted" in state:
+        state["stray_alerted"] = [m for m in state["stray_alerted"] if m in seen_stray]
+    if "bounce_count" in state:
+        state["bounce_count"] = {m: c for m, c in state["bounce_count"].items()
+                                 if m in seen_stray}
     return sorted(recipients)
 
 
@@ -321,6 +401,15 @@ def acquire_singleflight() -> bool:
     return True
 
 
+def singleflight_holder() -> str:
+    """讀鎖檔持有者 pid（診斷用）：正常回 pid 字串，讀不到/非數字回 '?'。"""
+    try:
+        t = LOCK_FILE.read_text().strip()
+        return t if t.isdigit() else "?"
+    except Exception:
+        return "?"
+
+
 def release_singleflight() -> None:
     try:
         LOCK_FILE.unlink()
@@ -340,7 +429,7 @@ def main() -> int:
     args = ap.parse_args()
 
     if not args.dry_run and not acquire_singleflight():
-        log("skip: another router run is active (single-flight)")
+        log(f"skip: another router run is active (single-flight, holder pid={singleflight_holder()})")
         return 0
     try:
         if args.daemon:

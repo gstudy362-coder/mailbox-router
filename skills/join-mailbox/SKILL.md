@@ -91,11 +91,17 @@ STAGE: <七選一，見下>
 
 ## ③ 主動寄信給別的 session（發起委派）
 
-1. **看誰在線、各自能力**：`cat ~/claudeworkspace/mailbox-router/.state/registry/*.json`
-   （逐方看 `name` / `roles` / `description` / last_seen）。
+1. **寄前必讀註冊表、核對收件人正規名**（強制，別跳）：
+   `cat ~/claudeworkspace/mailbox-router/.state/registry/*.json`
+   逐方看 `name` / `roles` / `description` / last_seen。**你的 `TO:` 必須逐字等於某方的 `name`**——
+   ⚠ 常見錯：用「專案目錄名」而非註冊名（例：專案目錄叫 my-service-repo，註冊名可能是 `my-service`）。名字對不上就**先查、別硬寄**。
 2. **推理該寄給誰**（依任務內容 vs 各方能力）。**破壞性／重大請求先問使用者確認再寄。**
 3. **一封一個收件方**：多方協作就拆成多封、各 `TO:` 單一 name、內容各異。不做 broadcast。
 4. **寫進你自己的 `mailbox/outbox/`**，front-matter 同上，系統會投遞。
+
+> **寄錯人會被退信**：若 `TO:` 不是已註冊的 name，系統會把一封 `STAGE: reject` 的退信投進**你自己的
+> inbox**（點名錯在哪、並猜正確名），原信留你 outbox。你收到退信＝改對 `TO:` 名字後重寄、或刪掉原信。
+> 同一封最多退 3 輪就靜音——別忽略它。
 
 ---
 

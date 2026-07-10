@@ -24,10 +24,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import time
 from pathlib import Path
-import os
 from typing import List, Tuple
 
 from registry import read_registry  # M1：吃註冊表拿所有方 mailbox_path
@@ -85,12 +85,60 @@ def prune_alerts(alert_state: dict, present_keys) -> dict:
     return {k: v for k, v in alert_state.items() if k in present}
 
 
+def stray_key(path) -> str:
+    """stray outbox 信的告警 key：`stray/<路徑>`（與卡信 key 空間不互撞）。"""
+    return f"stray/{path}"
+
+
+def stray_outbox_letters(candidates: List[Tuple[object, float]],
+                         registered_mailboxes, now: float,
+                         threshold: float) -> list:
+    """stray outbox 滯留信判定（純函式）。
+
+    candidates：workspace 有界 glob 掃到的 `[(letter_path, mtime), ...]`。
+    排除落在任何**已註冊** mailbox 路徑底下的（那些是合法 outbox，router 會投）；
+    其餘＝寫錯位置的信（decoy mailbox，router 永遠不掃 → 會靜默滯留），
+    年齡**嚴格大於** threshold 才回（同 stuck_letters 邊界語意）。
+    """
+    import os
+    roots = [os.path.normpath(str(m)) for m in registered_mailboxes]
+    out = []
+    for path, mtime in candidates:
+        p = os.path.normpath(str(path))
+        if any(p == r or p.startswith(r + os.sep) for r in roots):
+            continue                     # 合法信箱底下 → 非 stray
+        if now - mtime > threshold:
+            out.append((path, mtime))
+    return out
+
+
 def letter_key(party: str, name: str) -> str:
     """告警記錄的 per-letter key：`<party>/<檔名>`（同名信跨方不互撞）。"""
     return f"{party}/{name}"
 
 
 # ───────────────────────── I/O 邊界（薄層、可 monkeypatch）─────────────────
+
+STRAY_GLOBS = ("*/mailbox/outbox/*.md", "*/*/mailbox/outbox/*.md")
+
+
+def scan_stray_candidates() -> list:
+    """有界掃 workspace 下的 `mailbox/outbox/*.md` 候選（含註冊的，交純函式過濾）。
+
+    深度限兩層（涵蓋 decoy 實例 `<repo>/<subdir>/mailbox/`），不做無界 find。
+    """
+    out = []
+    for pat in STRAY_GLOBS:
+        try:
+            for f in WORKSPACE.glob(pat):
+                try:
+                    out.append((str(f), f.stat().st_mtime))
+                except OSError:
+                    continue
+        except OSError:
+            continue
+    return out
+
 
 def scan_party_inbox(mailbox_path) -> list:
     """掃某方 mailbox/inbox → `[(Path, mtime), ...]`（只認 *.md）。
@@ -186,7 +234,7 @@ def run_cycle(now: float = None) -> None:
 
     # 3. 掃每方 inbox，收集本輪「仍在 inbox 的卡信 key」。
     alert_state = load_alerts()
-    present_stuck = {}          # letter_key → mtime（本輪卡信）
+    present_stuck = {}          # letter_key → (name, mtime)（本輪卡信）
     for name, mbox in parties.items():
         if not mbox:
             continue
@@ -195,19 +243,33 @@ def run_cycle(now: float = None) -> None:
             key = letter_key(name, Path(path).name)
             present_stuck[key] = (name, mtime)
 
-    # 4. 哪些該本輪告警（新卡 / 超過 REALERT）。
-    to_alert = letters_to_alert(list(present_stuck.keys()), alert_state,
-                                now=now, realert=REALERT)
+    # 3b. 掃 stray outbox（寫錯位置的信：非註冊 mailbox 下的 outbox，router 不投）。
+    present_stray = {}          # stray_key → (path, mtime)
+    registered = [m for m in parties.values() if m]
+    for path, mtime in stray_outbox_letters(scan_stray_candidates(), registered,
+                                            now=now, threshold=STUCK_THRESHOLD):
+        present_stray[stray_key(path)] = (path, mtime)
+
+    # 4. 哪些該本輪告警（新卡 / 超過 REALERT）——卡信與 stray 共用閂鎖語意。
+    present_all = list(present_stuck.keys()) + list(present_stray.keys())
+    to_alert = letters_to_alert(present_all, alert_state, now=now, realert=REALERT)
     for key in to_alert:
-        name, mtime = present_stuck[key]
-        age_min = int((now - mtime) // 60)
-        _notify(f"信卡在 {name} inbox 約 {age_min} 分鐘未處理 — "
-                f"請開 session `{name}` 收信。({key})")
-        log(f"ALERT stuck {key} age={age_min}min")
+        if key in present_stuck:
+            name, mtime = present_stuck[key]
+            age_min = int((now - mtime) // 60)
+            _notify(f"信卡在 {name} inbox 約 {age_min} 分鐘未處理 — "
+                    f"請開 session `{name}` 收信。({key})")
+            log(f"ALERT stuck {key} age={age_min}min")
+        else:
+            path, mtime = present_stray[key]
+            age_min = int((now - mtime) // 60)
+            _notify(f"⚠️ 信寫在非註冊信箱（router 不會投遞）：{path}，"
+                    f"已滯留 {age_min} 分鐘 — 請搬到正確 outbox 或註冊該信箱。")
+            log(f"ALERT stray {key} age={age_min}min")
         alert_state[key] = now
 
-    # 5. 信離開 inbox（被處理移走）→ 清該信告警記錄。
-    pruned = prune_alerts(alert_state, present_keys=present_stuck.keys())
+    # 5. 信離開（被處理/搬走）→ 清該信告警記錄（卡信與 stray 一致 prune）。
+    pruned = prune_alerts(alert_state, present_keys=present_all)
     save_alerts(pruned)
 
 
